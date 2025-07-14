@@ -223,6 +223,35 @@ static void trim_whitespace(char *str) {
 }
 
 /* 
+ * Helper function to get a trimmed copy of a string without modifying the original
+ */
+static char* get_trimmed_string(const char *str) {
+    if (!str) return NULL;
+    
+    // Find start of non-whitespace content
+    const char *start = str;
+    while (*start && isspace((unsigned char)*start)) {
+        start++;
+    }
+    
+    // Find end of non-whitespace content
+    const char *end = start + strlen(start) - 1;
+    while (end > start && isspace((unsigned char)*end)) {
+        end--;
+    }
+    
+    // Calculate length and create copy
+    size_t len = end - start + 1;
+    char *trimmed = ast_malloc(len + 1);
+    if (trimmed) {
+        strncpy(trimmed, start, len);
+        trimmed[len] = '\0';
+    }
+    
+    return trimmed;
+}
+
+/* 
  * [v2.0]
  * Parse raw buffer (string) containing an RTSP or SIP Message 
  *   to get at the start of the list of Headers.
@@ -409,7 +438,7 @@ static const char app[] = "RTSP-SIP";
 #define SIP_STATE_INFO		10
 
 
-#define PKT_PAYLOAD     1450
+#define PKT_PAYLOAD     9000
 #define PKT_SIZE        (sizeof(struct ast_frame) + AST_FRIENDLY_OFFSET + PKT_PAYLOAD)
 #define PKT_OFFSET      (sizeof(struct ast_frame) + AST_FRIENDLY_OFFSET)
 
@@ -960,8 +989,13 @@ static int CheckAuthScheme(char *buffer,int bufferLen, char *scheme_to_match, ch
                 {
                     ast_debug(5,"    Found a WWW-Authenticate Header\n" );
 
-                    auth_start = headers.headers[i].field_value;
-                    auth_start++;
+                    // Get a trimmed copy of the auth header value
+                    char *auth_start_trimmed = get_trimmed_string(headers.headers[i].field_value);
+                    if (!auth_start_trimmed) {
+                        ast_debug(5,"    Failed to allocate memory for trimmed auth string\n");
+                        continue;
+                    }
+                    auth_start = auth_start_trimmed;
                     ast_debug(6,"      Auth start string:\n%s\n",auth_start);
                     do {
                         more_auths = NULL;
@@ -1011,6 +1045,9 @@ static int CheckAuthScheme(char *buffer,int bufferLen, char *scheme_to_match, ch
 
                     }
                     while(more_auths != NULL);
+                    
+                    // Free the allocated trimmed string
+                    ast_free(auth_start_trimmed);
                 }
             }
             ast_debug(5,"  ---End Parsing Headers---\n");
@@ -1411,9 +1448,18 @@ static int RtspPlayerDigestAuthorization(struct RtspPlayer *player,char *cfg_use
 			string_len += sprintf(player->authorization+string_len,",nc\"%s\"",nc);
             
 	}
-	else{  /* RTSP NOT BEEN TESTED FOR DIGEST AUTH */
-		sprintf(player->authorization, "Authorization: Digest %s",digest_result);
-		ast_log(LOG_WARNING,"RTSP not tested for Digest Authentication.\n");
+	else{  /* RTSP - Use the same full format as SIP */
+		string_len = sprintf(player->authorization,
+			"Authorization: Digest " 
+			"username=\"%s\", realm=\"%s\", nonce=\"%s\", uri=\"%s\", response=\"%s\", algorithm=MD5",
+		cfg_username,rx_realm,nonce,uri,digest_result);
+		if(cnonce != NULL)
+			string_len += sprintf(player->authorization+string_len,", cnonce=\"%s\"",cnonce);
+		if(qop != NULL)
+			string_len += sprintf(player->authorization+string_len,", qop=\"%s\"",qop);
+		if(nc != NULL)
+			string_len += sprintf(player->authorization+string_len,", nc=\"%s\"",nc);
+		ast_debug(3,"RTSP Digest Authentication applied with full format\n");
 	}
 	ast_debug(3,"      Player Auth String: \n%s\n",player->authorization);
 	return 1;
@@ -1649,18 +1695,7 @@ static int RtspPlayerConnect(struct RtspPlayer *player, const char *ip, int port
 		sprintf(player->hostport,"[%s]",player->ip);
 	else
 		/* normal*/
-		strcpy(player->hostport,player->ip);
-
-	/* If not standard port */
-	if (port!=554)
-	{
-		/* Append port to ip */
-		/* PORT 17.5, fix compiler warning about sprintf arg1 alias w. arg3 */
-	     /*	sprintf(player->hostport,"%s:%d",player->hostport,player->port); OLD */
-		char temp[100];
-		strcpy(temp,player->hostport);
-	       	sprintf(player->hostport,"%s:%d",temp,player->port); 
-	}
+		sprintf(player->hostport,"%s:%d",player->ip,player->port);
 
 
 	/* Free mem */
@@ -1754,7 +1789,7 @@ static void RrspPlayerSetAudioTransport(struct RtspPlayer *player,const char* tr
 static void RrspPlayerSetVideoTransport(struct RtspPlayer *player,const char* transport)
 {
 	char *i;
-	int port;
+	int rtp_port,rtcp_port;
 	struct sockaddr * addr;
 	int size;
 	int PF;
@@ -1769,6 +1804,9 @@ static void RrspPlayerSetVideoTransport(struct RtspPlayer *player,const char* tr
 		return;
 	}
 
+	/* Get port number */
+	rtp_port = atoi(i+12);
+
 	/* Get to the rtcp port */
 	if (!(i=strstr(i,"-")))
 	{
@@ -1780,15 +1818,23 @@ static void RrspPlayerSetVideoTransport(struct RtspPlayer *player,const char* tr
 	}	
 
 	/* Get port number */
-	port = atoi(i+1);
+	rtcp_port = atoi(i+1);
 
 	/* Get send address */
-	addr = GetIPAddr(player->ip,port,player->isIPv6,&size,&PF);
+	addr = GetIPAddr(player->ip,rtp_port,player->isIPv6,&size,&PF);
+
+	/* Connect */
+	if (connect(player->videoRtp,addr,size)<0)
+		/* Log */
+		ast_log(LOG_DEBUG,"Could not connect video rtp port [%s,%d,%d].%s\n", player->ip,rtp_port,errno,strerror(errno));
+
+	/* Get send address */
+	addr = GetIPAddr(player->ip,rtcp_port,player->isIPv6,&size,&PF);
 
 	/* Connect */
 	if (connect(player->videoRtcp,addr,size)<0)
 		/* Log */
-		ast_log(LOG_DEBUG,"Could not connect video rtcp port [%s,%d,%d].%s\n", player->ip,port,errno,strerror(errno));
+		ast_log(LOG_DEBUG,"Could not connect video rtcp port [%s,%d,%d].%s\n", player->ip,rtcp_port,errno,strerror(errno));
 
 	/* Free Addr */
      /*	free(addr); OLD */
@@ -1840,8 +1886,8 @@ static int RtspPlayerOptions(struct RtspPlayer *player,const char *url)
         snprintf(request,1024,
                         "OPTIONS rtsp://%s%s RTSP/1.0\r\n"
                         "CSeq: %d\r\n"
-                        "Session: %s\r\n"
-                        "User-Agent: app_rtsp\r\n",
+                        "User-Agent: app_rtsp\r\n"
+                        "Session: %s\r\n",
                         player->hostport,url,player->cseq,player->session[player->numSessions-1]);
 
         /* End request */
@@ -2244,23 +2290,32 @@ static int RtspPlayerSetupAudio(struct RtspPlayer* player,const char *url)
 		/* Prepare request */
 		snprintf(request,1024,
 				"SETUP %s RTSP/1.0\r\n"
+				"Transport: RTP/AVP/UDP;unicast;client_port=%d-%d\r\n"
 				"CSeq: %d\r\n"
-				"%s"
-				"Transport: RTP/AVP;unicast;client_port=%d-%d\r\n"
 				"User-Agent: app_rtsp\r\n"
-				"\r\n",
-				url,player->cseq,sessionheader,player->audioRtpPort,player->audioRtcpPort);
+				"%s",
+				url,player->audioRtpPort,player->audioRtcpPort,player->cseq,sessionheader);
 	} else {
 		/* Prepare request */
 		snprintf(request,1024,
 				"SETUP rtsp://%s%s/%s RTSP/1.0\r\n"
+				"Transport: RTP/AVP/UDP;unicast;client_port=%d-%d\r\n"
 				"CSeq: %d\r\n"
-				"%s"
-				"Transport: RTP/AVP;unicast;client_port=%d-%d\r\n"
 				"User-Agent: app_rtsp\r\n"
-				"\r\n",
-				player->hostport,player->url,url,player->cseq,sessionheader,player->audioRtpPort,player->audioRtcpPort);
+				"%s",
+				player->hostport,player->url,url,player->audioRtpPort,player->audioRtcpPort,player->cseq,sessionheader);
 	}
+
+	/* If we are authorized */
+	if (player->authorization)
+	{
+		/* Append header */
+		strcat(request,player->authorization);
+		/* End line */
+		strcat(request,"\r\n");
+	}
+	/* End request */
+	strcat(request,"\r\n");
 
 	/* Send request */
 	ast_debug(3,"\n%s\n",request); //Added [v2.0]
@@ -2297,23 +2352,32 @@ static int RtspPlayerSetupVideo(struct RtspPlayer* player,const char *url)
 		/* Prepare request */
 		snprintf(request,1024,
 				"SETUP %s RTSP/1.0\r\n"
+				"Transport: RTP/AVP/UDP;unicast;client_port=%d-%d\r\n"
 				"CSeq: %d\r\n"
-				"%s"
-				"Transport: RTP/AVP;unicast;client_port=%d-%d\r\n"
 				"User-Agent: app_rtsp\r\n"
-				"\r\n",
-				url,player->cseq,sessionheader,player->videoRtpPort,player->videoRtcpPort);
+				"%s",
+				url,player->videoRtpPort,player->videoRtcpPort,player->cseq,sessionheader);
 	} else {
 		/* Prepare request */
 		snprintf(request,1024,
 				"SETUP rtsp://%s%s/%s RTSP/1.0\r\n"
+				"Transport: RTP/AVP/UDP;unicast;client_port=%d-%d\r\n"
 				"CSeq: %d\r\n"
-				"%s"
-				"Transport: RTP/AVP;unicast;client_port=%d-%d\r\n"
 				"User-Agent: app_rtsp\r\n"
-				"\r\n",
-				player->hostport,player->url,url,player->cseq,sessionheader,player->videoRtpPort,player->videoRtcpPort);
+				"%s",
+				player->hostport,player->url,url,player->videoRtpPort,player->videoRtcpPort,player->cseq,sessionheader);
 	}
+
+	/* If we are authorized */
+	if (player->authorization)
+	{
+		/* Append header */
+		strcat(request,player->authorization);
+		/* End line */
+		strcat(request,"\r\n");
+	}
+	/* End request */
+	strcat(request,"\r\n");
 
 	/* Send request */
 	if (!SendRequest(player->fd,request,&player->end))
@@ -2348,10 +2412,20 @@ static int RtspPlayerPlay(struct RtspPlayer* player)
 		snprintf(request,1024,
 				"PLAY rtsp://%s%s RTSP/1.0\r\n"
 				"CSeq: %d\r\n"
-				"Session: %s\r\n"
 				"User-Agent: app_rtsp\r\n"
-				"\r\n",
+				"Session: %s\r\n",
 				player->hostport,player->url,player->cseq,player->session[i]);
+
+		/* If we are authorized */
+		if (player->authorization)
+		{
+			/* Append header */
+			strcat(request,player->authorization);
+			/* End line */
+			strcat(request,"\r\n");
+		}
+		/* End request */
+		strcat(request,"\r\n");
 
 		/* Send request */
 	        ast_debug(3,"\n%s\n",request); //Added [v2.0]
@@ -2388,10 +2462,20 @@ static int RtspPlayerTeardown(struct RtspPlayer* player)
 		snprintf(request,1024,
 				"TEARDOWN rtsp://%s%s RTSP/1.0\r\n"
 				"CSeq: %d\r\n"
-				"Session: %s\r\n"
 				"User-Agent: app_rtsp\r\n"
-				"\r\n",
+				"Session: %s\r\n",
 				player->hostport,player->url,player->cseq,player->session[i]);
+
+		/* If we are authorized */
+		if (player->authorization)
+		{
+			/* Append header */
+			strcat(request,player->authorization);
+			/* End line */
+			strcat(request,"\r\n");
+		}
+		/* End request */
+		strcat(request,"\r\n");
 		/* Send request */
 		ast_debug(3, "\n%s\n",request); //Added [v2.0]
 		if (!SendRequest(player->fd,request,&player->end))
@@ -2631,11 +2715,11 @@ static struct SDPContent* CreateSDP(char *buffer,int bufferLen)
 					media->formats[n]->payload = atoi(i+9);
 					/* Append to all formats */
 					media->all |= media->formats[n]->format;
+					/* Inc medias */
+					n++;
 					/* Exit */
-					break;
+					//break;
 				}
-			/* Inc medias */
-			n++;
 			
 		} else if (strncmp(i,"a=control:",10)==0){
 			/* if not in media */
@@ -3450,12 +3534,51 @@ static int main_loop(struct ast_channel *chan,char *ip, int rtsp_port, char *url
                                                 else
                                                 {
 					            ast_debug(3,"    - No Auth Method of Basic\n");
-						    /* Error */
-						    ast_log(LOG_ERROR,"-No Basic Authentication found for RTSP (Digest Auth not yet supported).\n");	
-						    /* End */
-						    player->end = 1;
-						    /* Exit */
-						    break;
+					            ast_debug(3,"    - Checking for Auth Method of Digest\n");
+
+                                                    struct DigestAuthData digest_data;
+                                                    if (GetAuthSchemeDigest(buffer,bufferLen,&digest_data) == 0 )
+                                                    {
+					                ast_debug(3,"    - Found Auth Method of Digest\n");
+							char *nc = NULL;
+							char *cnonce = NULL;
+							char *qop = NULL;
+							char uri[256];
+							sprintf(uri,"rtsp://%s%s", player->hostport, url);
+							char *method = "DESCRIBE";
+ 
+							ast_debug(5,"  Challenge Response Data- rx_realm: %s nonce: %s uri %s",\
+								digest_data.rx_realm, digest_data.nonce, uri); 
+                                              
+							if (RtspPlayerDigestAuthorization(player,username,\
+									password, digest_data.rx_realm,\
+									digest_data.nonce, nc, cnonce, qop, uri, \
+									digest_data.rx_realm, method, 0) > 0)
+							{
+								/* Send again the describe */
+								RtspPlayerDescribe(player,url);
+								/* Enter loop again */
+								break;
+							}
+							else
+							{
+								ast_log(LOG_ERROR,"Failed to create digest authorization\n");
+								/* End */
+								player->end = 1;
+								/* Exit */
+								break;
+							}
+                                                    }
+                                                    else
+                                                    {
+					                ast_debug(3,"    - No Auth Method of Digest\n");
+						        /* Error */
+						        ast_log(LOG_ERROR,"-No Basic or Digest Authentication found for RTSP.\n");	
+						        /* End */
+						        player->end = 1;
+						        /* Exit */
+						        break;
+                                                    }
                                                 }
 #ifdef OLD_AUTH_SCHEME
 						/* 
@@ -3567,7 +3690,7 @@ static int main_loop(struct ast_channel *chan,char *ip, int rtsp_port, char *url
 					ast_debug(4,"-Finding compatible codecs [%s]\n", \
 						  ast_format_cap_get_names(ast_channel_nativeformats(chan), &format_buf));
 					/* Get best audio track */
-					if (sdp->audio)
+					if (0)//sdp->audio) // FIXME disable audio from camera for now
 					{
 						/* Avoid overwritten */
 
@@ -3746,7 +3869,8 @@ static int main_loop(struct ast_channel *chan,char *ip, int rtsp_port, char *url
                                                                 }
 								/* Store format */
 								videoFormat = sdp->video->formats[i]->format;
-								videoNewFormat = video_compat_format; /* PORT 17.3 */
+								//videoNewFormat = video_compat_format; /* PORT 17.3 */
+								videoNewFormat = sdp->video->formats[i]->new_format; /* PORT 17.3 */
 								/* Store control */
 								videoControl = sdp->video->formats[i]->control;
 								/* Found best codec */
@@ -3934,6 +4058,14 @@ static int main_loop(struct ast_channel *chan,char *ip, int rtsp_port, char *url
 					/* Move data to begining */
 				     /*	memcpy(buffer,buffer+responseLen,bufferLen); OLD */
 					memmove(buffer,buffer+responseLen,bufferLen);
+					//send to first (even) server port (RTP) 8000 0000 0000 0000 0000 0000
+					//FIXME this is needed to start stream, but what should this really be?
+					short rtp_start[] = {0x0080,0x0000,0x0000,0x0000,0x0000,0x0000};
+					send(player->videoRtp, &rtp_start, sizeof(rtp_start), 0);
+					/* Create rtcp packet */
+					MediaStatsRR(&player->videoStats,&rtcp);
+					/* Send packet */
+					send(player->videoRtcp, &rtcp, sizeof(rtcp), 0);
 					/* Play */
 					RtspPlayerPlay(player);
 					break;
@@ -4096,6 +4228,7 @@ static int main_loop(struct ast_channel *chan,char *ip, int rtsp_port, char *url
 				 * appears to not used.  Will skip for now.
 				 */
 			     /*	sendFrame->subclass |= rtp->m; OLD */
+				sendFrame.subclass.frame_ending = rtp->m;
 
 				/* Set stats */
 				MediaStatsUpdate(&player->videoStats,ts,ntohs(rtp->seq),ntohl(rtp->ssrc));
@@ -4154,7 +4287,7 @@ static int main_loop(struct ast_channel *chan,char *ip, int rtsp_port, char *url
 				/* Reset media */
 				MediaStatsReset(&player->audioStats);
 				/* Send packet */
-     				send(player->audioRtcp, &rtcp, (rtcp.common.length+1)*4, 0);
+     				send(player->audioRtcp, &rtcp, (ntohs(rtcp.common.length)+1)*4, 0);
 				/* log */
 			    /*	ast_log(LOG_DEBUG,"-Sent rtcp audio report [%d]\n",errno); OLD */
 				ast_debug(2,"-sent rtcp audio report [%d]\n",errno); 
@@ -4164,7 +4297,7 @@ static int main_loop(struct ast_channel *chan,char *ip, int rtsp_port, char *url
 				/* Reset media */
 				MediaStatsReset(&player->videoStats);
 				/* Send packet */
-     				send(player->videoRtcp, &rtcp, (rtcp.common.length+1)*4, 0);
+     				send(player->videoRtcp, &rtcp, (ntohs(rtcp.common.length)+1)*4, 0);
 				/* log */
 			     /*	ast_log(LOG_DEBUG,"-Sent rtcp video report [%d]\n",errno); OLD */
 				ast_debug(2,"-sent rtcp video report [%d]\n",errno); 
@@ -4483,7 +4616,7 @@ static int main_loop(struct ast_channel *chan,char *ip, int rtsp_port, char *url
 						/* Reset media */
 						MediaStatsReset(&player->audioStats);
 						/* Send packet */
-						send(player->audioRtcp, &rtcp, (rtcp.common.length+1)*4, 0);
+						send(player->audioRtcp, &rtcp, (ntohs(rtcp.common.length)+1)*4, 0);
 						/* log */
 					     /*	ast_log(LOG_DEBUG,"-Sent rtcp audio report [%d]\n",errno); OLD */
 						ast_debug(2,"-sent rtcp audio report [%d]\n",errno); 
@@ -4496,7 +4629,7 @@ static int main_loop(struct ast_channel *chan,char *ip, int rtsp_port, char *url
 						/* Reset media */
 						MediaStatsReset(&player->videoStats);
 						/* Send packet */
-						send(player->videoRtcp, &rtcp, (rtcp.common.length+1)*4, 0);
+						send(player->videoRtcp, &rtcp, (ntohs(rtcp.common.length)+1)*4, 0);
 						/* log */
 					     /*	ast_log(LOG_DEBUG,"-Sent rtcp video report [%d]\n",errno); OLD */
 						ast_debug(2,"-sent rtcp video report [%d]\n",errno); 
