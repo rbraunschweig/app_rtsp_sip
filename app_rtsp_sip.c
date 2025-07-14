@@ -2600,7 +2600,7 @@ static void DestroyMedia(struct SDPMedia* media)
 	ast_free(media);
 }
 
-static struct SDPContent* CreateSDP(char *buffer,int bufferLen)
+static struct SDPContent* CreateSDP(char *buffer,int bufferLen, int sip_enable)
 {
 	struct SDPContent* sdp = NULL;
 	struct SDPMedia* media = NULL;;
@@ -2656,15 +2656,18 @@ static struct SDPContent* CreateSDP(char *buffer,int bufferLen)
 				media = sdp->audio;
 				/* ADDED. SIP Get the Peer's tcp/udp port. RFC 2327 p20
 				 * Ex. m=audio 49170/2 RTP/AVP 31. 49170 is the port. /2 or /(anything) is not supported
+				 * Only parse peer port when SIP is enabled since it's only used for SIP functionality
 				 */
-				sdp->audio->peer_media_port = (uint16_t) strtol(i+8, &k, 10);
-				if(sdp->audio->peer_media_port == 0)
-					ast_log(LOG_WARNING,"    peer rtp port is not provided\n");
-				else{
-					ast_debug(3,"      peer rtp port: %i\n",sdp->audio->peer_media_port);
-					if (strncmp(k-1,"RTP",3)==0) {
-						ast_log(LOG_ERROR,"Peer RTP transport is not RTP\n");
-						sdp->audio->peer_media_port = 0;
+				if (sip_enable) {
+					sdp->audio->peer_media_port = (uint16_t) strtol(i+8, &k, 10);
+					if(sdp->audio->peer_media_port == 0)
+						ast_log(LOG_WARNING,"    peer rtp port is not provided\n");
+					else{
+						ast_debug(3,"      peer rtp port: %i\n",sdp->audio->peer_media_port);
+						if (strncmp(k-1,"RTP",3)==0) {
+							ast_log(LOG_ERROR,"Peer RTP transport is not RTP\n");
+							sdp->audio->peer_media_port = 0;
+						}
 					}
 				}
 			} else 
@@ -3652,9 +3655,9 @@ static int main_loop(struct ast_channel *chan,char *ip, int rtsp_port, char *url
 
 					/* Create SDP */
 #ifdef TEST_BUFFER
-					sdp = CreateSDP(buffer,bufferLen); 
+					sdp = CreateSDP(buffer,bufferLen,sip_enable); 
 #else
-					sdp = CreateSDP(buffer,contentLength);
+					sdp = CreateSDP(buffer,contentLength,sip_enable);
 #endif
 					/* Get new length */
 					bufferLen -= contentLength;
@@ -4388,7 +4391,7 @@ static int main_loop(struct ast_channel *chan,char *ip, int rtsp_port, char *url
 									ast_log(LOG_WARNING,"SIP: Message Data too big to fit!!\n");
 									break; /* switch-case */
 								}
-								sip_sdp = CreateSDP(buffer,contentLength);
+								sip_sdp = CreateSDP(buffer,contentLength,1);
 					   
 								if (!sip_sdp)
 								{
@@ -4932,7 +4935,7 @@ static int rtsp_tunnel(struct ast_channel *chan,char *ip, int port, char *url)
 							/* If it's the sdp */
 							if (isSDP)
 								/* Create SDP */
-								sdp = CreateSDP(buffer,contentLength);
+								sdp = CreateSDP(buffer,contentLength,0);
 							/* Get new length */
 							bufferLen -= contentLength;
 							/* Move data to begining */
